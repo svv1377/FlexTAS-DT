@@ -1,4 +1,6 @@
 .idea/
 *.pyc
 out/
+__pycache__/
+.pytest_cache/
 output_data
