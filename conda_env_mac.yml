@@ -1,0 +1,19 @@
+name: drl
+channels:
+  - conda-forge
+  - pytorch
+  - defaults
+dependencies:
+  - python=3.10
+  - numpy
+  - pandas
+  - matplotlib
+  - networkx
+  - pip
+  - pip:
+      - torch
+      - torch_geometric
+      - gymnasium
+      - stable-baselines3
+      - sb3-contrib
+      - z3-solver
