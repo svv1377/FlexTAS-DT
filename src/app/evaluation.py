@@ -11,6 +11,7 @@ import random
 from typing import Optional, List
 
 from definitions import OUT_DIR
+from src.app.dt.dt_scheduler import DTScheduler
 from src.app.drl_scheduler import DrlScheduler
 from src.app.no_wait_tabu_scheduler import TimeTablingScheduler, GatingStrategy
 from src.app.scheduler import BaseScheduler, ResAnalyzer
@@ -142,6 +143,7 @@ class ExpSettings:
     test_no_gate: bool = False
     test_random_gate: bool = False
     test_drl: Optional[str] = None
+    test_dt: Optional[str] = None
     test_smt: bool = False
 
 
@@ -194,6 +196,12 @@ def evaluate_single(settings: ExpSettings,
             scheduler.load_model(best_model_path, "MaskablePPO")
             list_schedulers.append(("drl", scheduler))
 
+        if settings.test_dt is not None:
+            dt_model_path = settings.test_dt
+            assert os.path.isfile(dt_model_path), "Cannot find the DT model"
+            scheduler = DTScheduler(network, model_path=dt_model_path, timeout_s=settings.timeout)
+            list_schedulers.append(("dt", scheduler))
+
         if settings.test_smt:
             scheduler = SmtScheduler(network, timeout_s=settings.timeout)
             list_schedulers.append(("smt", scheduler))
@@ -216,6 +224,7 @@ def evaluate_experiments(topos: List[str], list_num_flows: List[int],
                          link_rate: int, num_tests: int,
                          list_obj: List[str],
                          drl_model: str=None,
+                         dt_model: str=None,
                          jitters: List[float]=None,
                          periods: List[int]=None,
                          num_non_tsn_devices: int=0,
@@ -224,7 +233,7 @@ def evaluate_experiments(topos: List[str], list_num_flows: List[int],
                          timeout: int=None):
     """
     Args:
-        list_obj: valid options: "gcl", "all_gate", "no_gate", "random_gate", "drl", "smt"
+        list_obj: valid options: "gcl", "all_gate", "no_gate", "random_gate", "drl", "dt", "smt"
     """
     list_df = []
     test_gcl = "gcl" in list_obj
@@ -239,6 +248,13 @@ def evaluate_experiments(topos: List[str], list_num_flows: List[int],
     else:
         drl_model = None
 
+    test_dt = "dt" in list_obj
+    if test_dt:
+        assert dt_model is not None, "Should specify the DT model"
+        assert os.path.isfile(dt_model), "Cannot find the DT model"
+    else:
+        dt_model = None
+
     test_smt = "smt" in list_obj
 
     list_settings = [
@@ -250,6 +266,7 @@ def evaluate_experiments(topos: List[str], list_num_flows: List[int],
             test_no_gate=test_no_gate,
             test_random_gate=test_random_gate,
             test_drl=drl_model,
+            test_dt=dt_model,
             test_smt=test_smt,
         )
         for topo, num_flow in itertools.product(topos, list_num_flows)

@@ -145,6 +145,7 @@ def scheduler_to_trajectory(
     schedule_res: ScheduleRes,
     scheduler_name: str,
     topo: str,
+    validate_replay: bool = True,
 ) -> Optional[Trajectory]:
     """
     将调度结果转换为 per-hop 轨迹。
@@ -163,6 +164,18 @@ def scheduler_to_trajectory(
         traj = replay.replay()
         traj.metadata["scheduler_type"] = scheduler_name
         traj.metadata["topo"] = topo
+        traj.metadata["replay_validated"] = False
+
+        if validate_replay:
+            valid, reason = replay.validate_trajectory(traj)
+            if not valid:
+                logger.warning(
+                    f"Filtered invalid replay trajectory "
+                    f"(scheduler={scheduler_name}, topo={topo}): {reason}"
+                )
+                return None
+            traj.metadata["replay_validated"] = True
+
         return traj
     except Exception as e:
         logger.warning(f"Failed to convert schedule result to trajectory: {e}")
@@ -177,6 +190,7 @@ def generate_trajectories_from_scheduler(
     timeout_s: int = 60,
     link_rate: int = 100,
     seed_start: int = 0,
+    validate_replay: bool = True,
 ) -> List[Trajectory]:
     """
     使用指定调度器批量生成轨迹。
@@ -210,7 +224,8 @@ def generate_trajectories_from_scheduler(
 
         # 转换为轨迹
         traj = scheduler_to_trajectory(
-            network, schedule_res, scheduler_name, topo
+            network, schedule_res, scheduler_name, topo,
+            validate_replay=validate_replay,
         )
 
         if traj is not None:
@@ -301,6 +316,7 @@ def build_offline_dataset(
     gamma: float = 1.0,
     include_env_random: bool = False,
     env_episodes: int = 200,
+    validate_replay: bool = True,
 ) -> DTDataset:
     """
     构建完整的离线数据集。
@@ -316,6 +332,7 @@ def build_offline_dataset(
         gamma: RTG 折扣因子
         include_env_random: 是否包含环境随机轨迹
         env_episodes: 环境随机轨迹数
+        validate_replay: 是否用真实 NetEnv.step 校验并过滤调度器回放轨迹
 
     Returns:
         DTDataset
@@ -339,6 +356,7 @@ def build_offline_dataset(
             timeout_s=timeout_s,
             link_rate=link_rate,
             seed_start=hash(sched_name) % 10000,
+            validate_replay=validate_replay,
         )
         all_trajectories.extend(trajs)
         logger.info(f"Collected {len(trajs)} trajectories from {sched_name}")
@@ -360,6 +378,7 @@ def build_offline_dataset(
             timeout_s=timeout_s,
             link_rate=link_rate,
             seed_start=9000,
+            validate_replay=validate_replay,
         )
         all_trajectories.extend(trajs)
         logger.info(f"Collected {len(trajs)} trajectories from SMT")
@@ -417,6 +436,7 @@ def build_multi_topo_dataset(
     timeout_s: int = 60,
     link_rate: int = 100,
     gamma: float = 1.0,
+    validate_replay: bool = True,
 ) -> DTDataset:
     """
     为多个拓扑构建数据集并合并。
@@ -437,6 +457,7 @@ def build_multi_topo_dataset(
             timeout_s=timeout_s,
             link_rate=link_rate,
             gamma=gamma,
+            validate_replay=validate_replay,
         )
         merged.merge(dataset)
 
@@ -496,6 +517,8 @@ def main():
                         help="是否包含环境随机策略轨迹")
     parser.add_argument("--env_episodes", type=int, default=200,
                         help="环境随机轨迹数 (default: 200)")
+    parser.add_argument("--no_validate_replay", action="store_true",
+                        help="关闭调度器轨迹的真实 NetEnv.step 复放校验")
     parser.add_argument("--log_level", type=str, default="INFO",
                         help="日志级别 (default: INFO)")
 
@@ -537,6 +560,7 @@ def main():
             gamma=args.gamma,
             include_env_random=args.include_env_random,
             env_episodes=args.env_episodes,
+            validate_replay=not args.no_validate_replay,
         )
     else:
         dataset = build_multi_topo_dataset(
@@ -548,6 +572,7 @@ def main():
             timeout_s=args.timeout,
             link_rate=args.link_rate,
             gamma=args.gamma,
+            validate_replay=not args.no_validate_replay,
         )
 
     logger.info(f"\n{'='*60}")

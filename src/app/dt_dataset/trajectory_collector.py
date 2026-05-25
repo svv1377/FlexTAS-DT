@@ -166,6 +166,18 @@ class SchedulerTrajectoryReplay:
                 gating = operation.gating_time is not None
                 self._schedule_index[(flow.flow_id, link.link_id)] = gating
 
+    def _fresh_env_without_shuffle(self) -> NetEnv:
+        """Create a clean NetEnv while preserving the scheduler flow order."""
+        env = NetEnv(self.network)
+        env.flows = list(self.flows)
+        env.flow_index = 0
+        env.temp_operations = []
+        env.links_operations.clear()
+        env.links_gcl.clear()
+        env.reward = 0
+        env.last_action = None
+        return env
+
     def replay(self) -> Trajectory:
         """
         重放调度过程，生成 per-hop 轨迹。
@@ -180,8 +192,7 @@ class SchedulerTrajectoryReplay:
             Trajectory: 包含完整的 (state, action, reward, done) 序列
         """
         # 创建新 env，使用 network 的原始 flow 顺序（不 shuffle）
-        # 通过临时覆盖 reset 中的 shuffle 来确保顺序一致
-        env = NetEnv(self.network)
+        env = self._fresh_env_without_shuffle()
 
         traj = Trajectory()
         traj.metadata = {
@@ -189,14 +200,6 @@ class SchedulerTrajectoryReplay:
             "num_flows": len(self.flows),
             "scheduler_type": "unknown",
         }
-
-        # 重置 env 状态（但不通过 reset()，避免 shuffle）
-        env.flow_index = 0
-        env.temp_operations = []
-        env.links_operations.clear()
-        env.links_gcl.clear()
-        env.reward = 0
-        env.last_action = None
 
         # --- 按 flow 顺序、per-hop 逐步回放 ---
         for flow_idx, flow in enumerate(self.flows):
@@ -236,6 +239,92 @@ class SchedulerTrajectoryReplay:
         traj.success = True
         traj.num_flows = len(self.flows)
         return traj
+
+    def validate_trajectory(
+        self,
+        traj: Trajectory,
+        reward_tol: float = 1e-5,
+        state_atol: float = 1e-5,
+        state_rtol: float = 1e-5,
+        compare_states: bool = True,
+    ) -> Tuple[bool, str]:
+        """
+        Replay the inferred action sequence through the real NetEnv.step().
+
+        This rejects trajectories whose approximate replay state/reward/done
+        sequence diverges from the environment that DTScheduler will use at
+        inference time.
+        """
+        if not traj.is_valid():
+            return False, "trajectory fields have inconsistent lengths"
+        if len(traj) == 0:
+            return False, "empty trajectory"
+
+        env = self._fresh_env_without_shuffle()
+        done = False
+        info = {"success": False}
+
+        for step_idx, (expected_state, action, expected_reward, expected_done) in enumerate(
+            zip(traj.states, traj.actions, traj.rewards, traj.dones)
+        ):
+            if done:
+                return False, f"trajectory has extra steps after done at step {step_idx}"
+
+            try:
+                actual_state = env._generate_state()
+            except Exception as exc:
+                return False, f"failed to generate env state at step {step_idx}: {exc}"
+
+            if compare_states and not self._states_close(
+                actual_state, expected_state, atol=state_atol, rtol=state_rtol
+            ):
+                return False, f"state mismatch at step {step_idx}"
+
+            try:
+                _, reward, done, _, info = env.step(int(action))
+            except Exception as exc:
+                return False, f"env.step raised at step {step_idx}: {exc}"
+
+            if abs(float(reward) - float(expected_reward)) > reward_tol:
+                return (
+                    False,
+                    f"reward mismatch at step {step_idx}: "
+                    f"expected {expected_reward}, got {reward}",
+                )
+
+            if bool(done) != bool(expected_done):
+                return (
+                    False,
+                    f"done mismatch at step {step_idx}: "
+                    f"expected {expected_done}, got {done}",
+                )
+
+        if not done:
+            return False, "action sequence ended before env reached done"
+
+        success = bool(info.get("success", False))
+        if success != bool(traj.success):
+            return False, f"success mismatch: expected {traj.success}, got {success}"
+
+        return True, ""
+
+    @staticmethod
+    def _states_close(lhs: Dict, rhs: Dict, atol: float, rtol: float) -> bool:
+        if lhs.keys() != rhs.keys():
+            return False
+
+        for key in lhs:
+            lhs_arr = np.asarray(lhs[key])
+            rhs_arr = np.asarray(rhs[key])
+            if lhs_arr.shape != rhs_arr.shape:
+                return False
+            if np.issubdtype(lhs_arr.dtype, np.integer) or np.issubdtype(rhs_arr.dtype, np.integer):
+                if not np.array_equal(lhs_arr, rhs_arr):
+                    return False
+            elif not np.allclose(lhs_arr, rhs_arr, atol=atol, rtol=rtol):
+                return False
+
+        return True
 
     def _compute_reward(
         self,

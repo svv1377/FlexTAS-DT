@@ -80,7 +80,11 @@ def main():
     )
 
     logger.info(f"Training complete. Best val loss: {trainer.best_val_loss:.4f}")
-    logger.info(f"Model saved to: {args.output}_best.pt")
+    best_path = f"{args.output}_best.pt"
+    final_path = f"{args.output}.pt"
+    if os.path.exists(best_path):
+        logger.info(f"Best model saved to: {best_path}")
+    logger.info(f"Final model saved to: {final_path}")
 
 
 if __name__ == "__main__":

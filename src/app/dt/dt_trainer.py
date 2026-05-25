@@ -53,12 +53,16 @@ class DTTrainingDataset(Dataset):
         context_len: int = 600,
         state_dim: int = 192,
         pre_encode: bool = True,
+        normalize_rtgs: bool = True,
     ):
         self.dt_dataset = dt_dataset
         self.state_encoder = state_encoder
         self.device = device
         self.context_len = context_len
         self.state_dim = state_dim
+        self.normalize_rtgs = normalize_rtgs
+        self.rtg_mean = float(dt_dataset.rtg_mean)
+        self.rtg_std = float(dt_dataset.rtg_std) if float(dt_dataset.rtg_std) > 1e-6 else 1.0
 
         self.trajectories = dt_dataset.trajectories
 
@@ -124,7 +128,10 @@ class DTTrainingDataset(Dataset):
                         state_tensor = self._state_projection(state_tensor)
                 self.encoded_states.append(state_tensor)
 
-            self.encoded_rtgs.append(torch.from_numpy(traj.rtgs[:T]).float())
+            rtgs = torch.from_numpy(traj.rtgs[:T]).float()
+            if self.normalize_rtgs:
+                rtgs = (rtgs - self.rtg_mean) / self.rtg_std
+            self.encoded_rtgs.append(rtgs)
             self.encoded_actions.append(torch.from_numpy(traj.actions[:T]).long())
             self.encoded_masks.append(torch.from_numpy(traj.mask[:T]).bool())
 
@@ -205,6 +212,9 @@ class DTTrainer:
         weight_decay: float = 1e-4,
         warmup_steps: int = 1000,
         grad_clip: float = 1.0,
+        rtg_mean: float = 0.0,
+        rtg_std: float = 1.0,
+        normalize_rtgs: bool = True,
     ):
         self.model = model.to(device)
         self.state_encoder = state_encoder.to(device)
@@ -218,6 +228,9 @@ class DTTrainer:
         self.grad_clip = grad_clip
         self.warmup_steps = warmup_steps
         self.learning_rate = learning_rate
+        self.rtg_mean = float(rtg_mean)
+        self.rtg_std = float(rtg_std) if float(rtg_std) > 1e-6 else 1.0
+        self.normalize_rtgs = normalize_rtgs
 
         # Learning rate scheduler (cosine with warmup)
         self.scheduler = None  # Will be set in train()
@@ -378,10 +391,14 @@ class DTTrainer:
         os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
         checkpoint = {
             "model_state_dict": self.model.state_dict(),
+            "state_encoder_state_dict": self.state_encoder.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "train_losses": self.train_losses,
             "val_losses": self.val_losses,
             "best_val_loss": self.best_val_loss,
+            "rtg_mean": self.rtg_mean,
+            "rtg_std": self.rtg_std,
+            "normalize_rtgs": self.normalize_rtgs,
             "model_config": {
                 "state_dim": self.model.state_dim,
                 "embed_dim": self.model.embed_dim,
@@ -397,10 +414,22 @@ class DTTrainer:
         """加载模型 checkpoint。"""
         checkpoint = torch.load(f"{path}.pt", map_location=self.device, weights_only=False)
         self.model.load_state_dict(checkpoint["model_state_dict"])
+        if "state_encoder_state_dict" in checkpoint:
+            self.state_encoder.load_state_dict(checkpoint["state_encoder_state_dict"])
+        else:
+            logger.warning(
+                "Checkpoint has no state_encoder_state_dict; keeping current "
+                "FeaturesExtractor weights."
+            )
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         self.train_losses = checkpoint.get("train_losses", [])
         self.val_losses = checkpoint.get("val_losses", [])
         self.best_val_loss = checkpoint.get("best_val_loss", float('inf'))
+        self.rtg_mean = float(checkpoint.get("rtg_mean", self.rtg_mean))
+        self.rtg_std = float(checkpoint.get("rtg_std", self.rtg_std))
+        if self.rtg_std < 1e-6:
+            self.rtg_std = 1.0
+        self.normalize_rtgs = bool(checkpoint.get("normalize_rtgs", self.normalize_rtgs))
         logger.info(f"Checkpoint loaded from {path}.pt (best_val_loss={self.best_val_loss:.4f})")
 
 
@@ -507,6 +536,9 @@ def train_gin_dt(
     trainer = DTTrainer(
         model, state_encoder, device,
         learning_rate=learning_rate,
+        rtg_mean=dataset.rtg_mean,
+        rtg_std=dataset.rtg_std,
+        normalize_rtgs=True,
     )
 
     trainer.train(

@@ -64,6 +64,12 @@ class DTScheduler(BaseScheduler):
         # 先加载 checkpoint 获取配置
         ckpt_path = model_path if model_path.endswith(".pt") else f"{model_path}.pt"
         checkpoint = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+        self.state_encoder_state_dict = checkpoint.get("state_encoder_state_dict")
+        self.rtg_mean = float(checkpoint.get("rtg_mean", 0.0))
+        self.rtg_std = float(checkpoint.get("rtg_std", 1.0))
+        if self.rtg_std < 1e-6:
+            self.rtg_std = 1.0
+        self.normalize_rtgs = bool(checkpoint.get("normalize_rtgs", False))
         config = checkpoint.get("model_config", {})
 
         state_dim = config.get("state_dim", 192)
@@ -100,19 +106,34 @@ class DTScheduler(BaseScheduler):
         """延迟初始化 state encoder（需要 env 来确定 observation_space）。"""
         if self.state_encoder is None:
             self.state_encoder = FeaturesExtractor(env.observation_space)
+            if self.state_encoder_state_dict is not None:
+                self.state_encoder.load_state_dict(self.state_encoder_state_dict)
+            else:
+                logger.warning(
+                    "Checkpoint has no state_encoder_state_dict; using a freshly "
+                    "initialized FeaturesExtractor. DT performance may be invalid."
+                )
             self.state_encoder.to(self.device)
             self.state_encoder.eval()
 
-    def _get_target_rtg(self) -> float:
-        """获取目标 RTG。若未设置，基于经验估计。"""
+    def _get_target_rtg_raw(self) -> float:
+        """获取原始奖励尺度下的目标 RTG。若未设置，基于数据集统计或经验估计。"""
         if self.target_rtg is not None:
             return self.target_rtg
+
+        if self.normalize_rtgs:
+            return self.rtg_mean + self.rtg_std
 
         # 基于数据集统计的经验估计
         # CEV: ~188, RRG: ~96, ERG: ~90, BAG: ~84
         # 默认使用较高值偏向高质量解
         num_flows = len(self.flows)
         return num_flows * 1.9  # ~1 reward per hop, ~3.7 hops average for CEV
+
+    def _normalize_rtg(self, rtg: float) -> float:
+        if not self.normalize_rtgs:
+            return rtg
+        return (rtg - self.rtg_mean) / self.rtg_std
 
     def schedule(self) -> bool:
         """
@@ -133,25 +154,38 @@ class DTScheduler(BaseScheduler):
 
         self._init_state_encoder(env)
 
-        target_rtg = self._get_target_rtg()
-        logger.info(f"DT scheduling: target_rtg={target_rtg:.1f}, "
-                    f"num_flows={len(self.flows)}")
+        target_rtg_raw = self._get_target_rtg_raw()
+        target_rtg_norm = self._normalize_rtg(target_rtg_raw)
+        if self.normalize_rtgs:
+            logger.info(
+                f"DT scheduling: target_rtg_raw={target_rtg_raw:.3f}, "
+                f"target_rtg_norm={target_rtg_norm:.3f}, "
+                f"rtg_mean={self.rtg_mean:.3f}, rtg_std={self.rtg_std:.3f}, "
+                f"num_flows={len(self.flows)}"
+            )
+        else:
+            logger.info(f"DT scheduling: target_rtg={target_rtg_raw:.1f}, "
+                        f"num_flows={len(self.flows)}")
 
         # 自回归生成
         success, actions, rewards, states = self.model.generate_episode(
             env=env,
-            target_rtg=target_rtg,
+            target_rtg=target_rtg_raw,
             state_encoder=self.state_encoder,
             deterministic=self.deterministic,
             max_steps=self.max_steps,
+            normalize_rtgs=self.normalize_rtgs,
+            rtg_mean=self.rtg_mean,
+            rtg_std=self.rtg_std,
         )
 
         elapsed = time.time() - start_time
 
         if success:
             self._res = env.links_operations.copy()
+            final_rtg_raw = target_rtg_raw - sum(rewards)
             logger.info(f"DT scheduling SUCCESS: {len(actions)} steps, "
-                        f"{elapsed:.2f}s, final_rtg={target_rtg - sum(rewards):.1f}")
+                        f"{elapsed:.2f}s, final_rtg_raw={final_rtg_raw:.1f}")
         else:
             logger.info(f"DT scheduling FAILED: {len(actions)} steps, "
                         f"{elapsed:.2f}s, flows_scheduled={env.flow_index}/{len(self.flows)}")
