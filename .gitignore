@@ -3,4 +3,6 @@
 out/
 __pycache__/
 .pytest_cache/
+terminalout.txt
+.DS_Store
 output_data
