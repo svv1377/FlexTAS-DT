@@ -40,6 +40,7 @@ from collections import defaultdict
 from typing import List, Dict, Optional, Tuple
 
 import numpy as np
+from sb3_contrib import MaskablePPO
 
 from definitions import OUT_DIR, ROOT_DIR
 from src.app.dt_dataset.trajectory_collector import (
@@ -90,6 +91,11 @@ SCHEDULER_REGISTRY = {
         "kwargs": {},
         "label": "smt",
     },
+    "drl": {
+        "class": None,
+        "kwargs": {},
+        "label": "drl",
+    },
 }
 
 logger = logging.getLogger(__name__)
@@ -99,13 +105,21 @@ logger = logging.getLogger(__name__)
 # 核心函数：从调度器生成轨迹
 # ============================================================================
 
-def generate_network(topo: str, num_flows: int, seed: int,
-                     link_rate: int = 100) -> Network:
+def generate_network(
+    topo: str,
+    num_flows: int,
+    seed: int,
+    link_rate: int = 100,
+    num_non_tsn_devices: int = 0,
+) -> Network:
     """生成一个随机网络实例。"""
     graph = generate_graph(topo, link_rate)
     flow_generator = FlowGenerator(graph, seed=seed)
     flows = flow_generator(num_flows)
-    return Network(graph, flows)
+    network = Network(graph, flows)
+    if num_non_tsn_devices > 0:
+        network.disable_gcl(num_non_tsn_devices)
+    return network
 
 
 def run_scheduler_and_get_result(
@@ -145,6 +159,7 @@ def scheduler_to_trajectory(
     schedule_res: ScheduleRes,
     scheduler_name: str,
     topo: str,
+    num_non_tsn_devices: int = 0,
     validate_replay: bool = True,
 ) -> Optional[Trajectory]:
     """
@@ -164,6 +179,7 @@ def scheduler_to_trajectory(
         traj = replay.replay()
         traj.metadata["scheduler_type"] = scheduler_name
         traj.metadata["topo"] = topo
+        traj.metadata["num_non_tsn_devices"] = num_non_tsn_devices
         traj.metadata["replay_validated"] = False
 
         if validate_replay:
@@ -189,6 +205,7 @@ def generate_trajectories_from_scheduler(
     scheduler_name: str,
     timeout_s: int = 60,
     link_rate: int = 100,
+    num_non_tsn_devices: int = 0,
     seed_start: int = 0,
     validate_replay: bool = True,
 ) -> List[Trajectory]:
@@ -205,11 +222,14 @@ def generate_trajectories_from_scheduler(
     fail_count = 0
 
     logger.info(f"[{scheduler_name}] Starting: target={num_episodes} episodes, "
-                f"topo={topo}, flows={num_flows}")
+                f"topo={topo}, flows={num_flows}, "
+                f"num_non_tsn_devices={num_non_tsn_devices}")
 
     for i in range(num_episodes):
         seed = seed_start + i
-        network = generate_network(topo, num_flows, seed, link_rate)
+        network = generate_network(
+            topo, num_flows, seed, link_rate, num_non_tsn_devices
+        )
 
         # 运行调度器
         ok, schedule_res, err_msg = run_scheduler_and_get_result(
@@ -225,6 +245,7 @@ def generate_trajectories_from_scheduler(
         # 转换为轨迹
         traj = scheduler_to_trajectory(
             network, schedule_res, scheduler_name, topo,
+            num_non_tsn_devices=num_non_tsn_devices,
             validate_replay=validate_replay,
         )
 
@@ -253,6 +274,7 @@ def generate_trajectories_from_env(
     num_episodes: int,
     scheduler_name: str = "env_random",
     link_rate: int = 100,
+    num_non_tsn_devices: int = 0,
     seed_start: int = 0,
 ) -> List[Trajectory]:
     """
@@ -265,11 +287,14 @@ def generate_trajectories_from_env(
     trajectories = []
 
     logger.info(f"[{scheduler_name}] Starting env-based collection: "
-                f"target={num_episodes} episodes, topo={topo}, flows={num_flows}")
+                f"target={num_episodes} episodes, topo={topo}, flows={num_flows}, "
+                f"num_non_tsn_devices={num_non_tsn_devices}")
 
     for i in range(num_episodes):
         seed = seed_start + i
-        network = generate_network(topo, num_flows, seed, link_rate)
+        network = generate_network(
+            topo, num_flows, seed, link_rate, num_non_tsn_devices
+        )
 
         env = NetEnv(network)
 
@@ -289,6 +314,7 @@ def generate_trajectories_from_env(
         traj = collector.finish_episode(info)
         traj.metadata["scheduler_type"] = scheduler_name
         traj.metadata["topo"] = topo
+        traj.metadata["num_non_tsn_devices"] = num_non_tsn_devices
         trajectories.append(traj)
 
         if (i + 1) % 50 == 0:
@@ -297,6 +323,115 @@ def generate_trajectories_from_env(
     successes = sum(1 for t in trajectories if t.success)
     logger.info(f"[{scheduler_name}] Done: {len(trajectories)} trajectories "
                 f"(success={successes})")
+    return trajectories
+
+
+def _normalize_model_path(model_path: str, suffix: str) -> str:
+    """Return path without suffix for SB3 loaders that append their extension."""
+    return model_path[:-len(suffix)] if model_path.endswith(suffix) else model_path
+
+
+def generate_trajectories_from_drl(
+    topo: str,
+    num_flows: int,
+    num_episodes: int,
+    model_path: str,
+    link_rate: int = 100,
+    num_non_tsn_devices: int = 0,
+    seed_start: int = 0,
+    timeout_s: int = 60,
+    include_failures: bool = False,
+    max_steps_per_episode: Optional[int] = None,
+) -> List[Trajectory]:
+    """
+    通过已训练的 MaskablePPO 模型与真实 NetEnv 交互采集轨迹。
+
+    不经过 ScheduleRes replay，因此 state/action/reward/done 天然与
+    NetEnv.step() 对齐。默认只保留成功 episode。
+    """
+    if model_path is None:
+        raise ValueError("--drl_model is required when scheduler contains 'drl'")
+
+    normalized_path = _normalize_model_path(model_path, ".zip")
+    if not os.path.isfile(f"{normalized_path}.zip"):
+        raise FileNotFoundError(f"No such DRL model: {normalized_path}.zip")
+
+    logger.info(f"[drl] Loading MaskablePPO model from {normalized_path}.zip")
+    model = MaskablePPO.load(normalized_path)
+
+    trajectories = []
+    success_count = 0
+    fail_count = 0
+    timeout_count = 0
+
+    logger.info(f"[drl] Starting env-based collection: target={num_episodes} episodes, "
+                f"topo={topo}, flows={num_flows}, "
+                f"num_non_tsn_devices={num_non_tsn_devices}, "
+                f"include_failures={include_failures}")
+
+    for i in range(num_episodes):
+        seed = seed_start + i
+        network = generate_network(
+            topo, num_flows, seed, link_rate, num_non_tsn_devices
+        )
+        env = NetEnv(network)
+        collector = TrajectoryCollector(env)
+
+        obs, _ = env.reset()
+        collector.start_episode()
+
+        done = False
+        info = {"success": False}
+        start_time = time.time()
+        step = 0
+
+        while not done:
+            collector.record_state(obs)
+            action_mask = env.action_masks()
+            action, _ = model.predict(
+                obs,
+                deterministic=True,
+                action_masks=action_mask,
+            )
+            action_val = int(action)
+            obs, reward, done, truncated, info = env.step(action_val)
+            collector.record_step(action_val, reward, done)
+            step += 1
+
+            if max_steps_per_episode is not None and step >= max_steps_per_episode:
+                timeout_count += 1
+                info = {"success": False, "msg": "max_steps_per_episode reached"}
+                done = True
+
+            if time.time() - start_time > timeout_s:
+                timeout_count += 1
+                info = {"success": False, "msg": f"timeout {timeout_s}s reached"}
+                done = True
+
+        traj = collector.finish_episode(info)
+        traj.metadata["scheduler_type"] = "drl"
+        traj.metadata["topo"] = topo
+        traj.metadata["num_non_tsn_devices"] = num_non_tsn_devices
+        traj.metadata["model_path"] = normalized_path + ".zip"
+        traj.metadata["seed"] = seed
+        traj.metadata["replay_validated"] = True
+        traj.metadata["collection"] = "env_step"
+
+        if traj.success:
+            trajectories.append(traj)
+            success_count += 1
+        else:
+            fail_count += 1
+            if include_failures:
+                trajectories.append(traj)
+
+        if (i + 1) % 50 == 0:
+            logger.info(f"[drl] Progress: {i+1}/{num_episodes} "
+                        f"(success={success_count}, fail={fail_count}, "
+                        f"kept={len(trajectories)})")
+
+    logger.info(f"[drl] Done: kept={len(trajectories)}, success={success_count}, "
+                f"fail={fail_count}, timeout={timeout_count}")
     return trajectories
 
 
@@ -313,10 +448,14 @@ def build_offline_dataset(
     output_path: str,
     timeout_s: int = 60,
     link_rate: int = 100,
+    num_non_tsn_devices: int = 0,
     gamma: float = 1.0,
     include_env_random: bool = False,
     env_episodes: int = 200,
     validate_replay: bool = True,
+    drl_model: Optional[str] = None,
+    include_drl_failures: bool = False,
+    drl_max_steps: Optional[int] = None,
 ) -> DTDataset:
     """
     构建完整的离线数据集。
@@ -329,10 +468,14 @@ def build_offline_dataset(
         output_path: 输出路径
         timeout_s: 调度器超时（秒）
         link_rate: 链路速率
+        num_non_tsn_devices: 禁用 GCL 的非 TSN 设备数量，与 evaluation.py 对齐
         gamma: RTG 折扣因子
         include_env_random: 是否包含环境随机轨迹
         env_episodes: 环境随机轨迹数
         validate_replay: 是否用真实 NetEnv.step 校验并过滤调度器回放轨迹
+        drl_model: 已训练 MaskablePPO 模型路径（scheduler 包含 drl 时必填）
+        include_drl_failures: 是否保留 DRL 失败 episode
+        drl_max_steps: DRL 单 episode 最大步数
 
     Returns:
         DTDataset
@@ -341,8 +484,8 @@ def build_offline_dataset(
 
     # 阶段 1：Tabu（时间表）调度器 —— 主力数据源
     for sched_name in scheduler_names:
-        if sched_name == "smt":
-            continue  # SMT 在阶段 2 单独处理
+        if sched_name in ("smt", "drl"):
+            continue  # SMT / DRL 在后续阶段单独处理
 
         logger.info(f"{'='*60}")
         logger.info(f"Stage 1: Generating Tabu trajectories [{sched_name}]")
@@ -355,6 +498,7 @@ def build_offline_dataset(
             scheduler_name=sched_name,
             timeout_s=timeout_s,
             link_rate=link_rate,
+            num_non_tsn_devices=num_non_tsn_devices,
             seed_start=hash(sched_name) % 10000,
             validate_replay=validate_replay,
         )
@@ -377,16 +521,38 @@ def build_offline_dataset(
             scheduler_name="smt",
             timeout_s=timeout_s,
             link_rate=link_rate,
+            num_non_tsn_devices=num_non_tsn_devices,
             seed_start=9000,
             validate_replay=validate_replay,
         )
         all_trajectories.extend(trajs)
         logger.info(f"Collected {len(trajs)} trajectories from SMT")
 
-    # 阶段 3（可选）：环境随机轨迹 —— 背景数据
+    # 阶段 3：DRL 策略轨迹 —— 真实 env.step 采集
+    if "drl" in scheduler_names:
+        logger.info(f"{'='*60}")
+        logger.info(f"Stage 3: Generating DRL trajectories")
+        logger.info(f"{'='*60}")
+
+        trajs = generate_trajectories_from_drl(
+            topo=topo,
+            num_flows=num_flows,
+            num_episodes=num_episodes,
+            model_path=drl_model,
+            link_rate=link_rate,
+            num_non_tsn_devices=num_non_tsn_devices,
+            seed_start=12000,
+            timeout_s=timeout_s,
+            include_failures=include_drl_failures,
+            max_steps_per_episode=drl_max_steps,
+        )
+        all_trajectories.extend(trajs)
+        logger.info(f"Collected {len(trajs)} trajectories from DRL")
+
+    # 阶段 4（可选）：环境随机轨迹 —— 背景数据
     if include_env_random:
         logger.info(f"{'='*60}")
-        logger.info(f"Stage 3: Generating env-random trajectories")
+        logger.info(f"Stage 4: Generating env-random trajectories")
         logger.info(f"{'='*60}")
 
         trajs = generate_trajectories_from_env(
@@ -395,6 +561,7 @@ def build_offline_dataset(
             num_episodes=env_episodes,
             scheduler_name="env_random",
             link_rate=link_rate,
+            num_non_tsn_devices=num_non_tsn_devices,
             seed_start=10000,
         )
         all_trajectories.extend(trajs)
@@ -435,8 +602,12 @@ def build_multi_topo_dataset(
     output_base: str,
     timeout_s: int = 60,
     link_rate: int = 100,
+    num_non_tsn_devices: int = 0,
     gamma: float = 1.0,
     validate_replay: bool = True,
+    drl_model: Optional[str] = None,
+    include_drl_failures: bool = False,
+    drl_max_steps: Optional[int] = None,
 ) -> DTDataset:
     """
     为多个拓扑构建数据集并合并。
@@ -456,8 +627,12 @@ def build_multi_topo_dataset(
             output_path=output_path,
             timeout_s=timeout_s,
             link_rate=link_rate,
+            num_non_tsn_devices=num_non_tsn_devices,
             gamma=gamma,
             validate_replay=validate_replay,
+            drl_model=drl_model,
+            include_drl_failures=include_drl_failures,
+            drl_max_steps=drl_max_steps,
         )
         merged.merge(dataset)
 
@@ -504,13 +679,16 @@ def main():
                         help="每个调度器的目标 episode 数 (default: 500)")
     parser.add_argument("--scheduler", type=str, default="tabu_all_gate",
                         help="调度器列表，逗号分隔。可选: tabu_all_gate, tabu_no_gate, "
-                             "tabu_random_gate, smt (default: tabu_all_gate)")
+                             "tabu_random_gate, smt, drl (default: tabu_all_gate)")
     parser.add_argument("--output", type=str, default=None,
                         help="输出路径（不含扩展名）(default: out/dt_data/<name>)")
     parser.add_argument("--timeout", type=int, default=60,
                         help="调度器超时秒数 (default: 60)")
     parser.add_argument("--link_rate", type=int, default=100,
                         help="链路速率 (default: 100)")
+    parser.add_argument("--num_non_tsn_devices", type=int, default=0,
+                        help="禁用 GCL 的非 TSN 设备数量，需与 evaluation.py 保持一致 "
+                             "(default: 0)")
     parser.add_argument("--gamma", type=float, default=1.0,
                         help="RTG 折扣因子 (default: 1.0)")
     parser.add_argument("--include_env_random", action="store_true",
@@ -519,6 +697,12 @@ def main():
                         help="环境随机轨迹数 (default: 200)")
     parser.add_argument("--no_validate_replay", action="store_true",
                         help="关闭调度器轨迹的真实 NetEnv.step 复放校验")
+    parser.add_argument("--drl_model", type=str, default=None,
+                        help="已训练 MaskablePPO 模型路径（scheduler 包含 drl 时必填）")
+    parser.add_argument("--include_drl_failures", action="store_true",
+                        help="保留 DRL 失败 episode（默认只保留成功轨迹）")
+    parser.add_argument("--drl_max_steps", type=int, default=None,
+                        help="DRL 单 episode 最大 step 数（默认不限制）")
     parser.add_argument("--log_level", type=str, default="INFO",
                         help="日志级别 (default: INFO)")
 
@@ -557,10 +741,14 @@ def main():
             output_path=output_base,
             timeout_s=args.timeout,
             link_rate=args.link_rate,
+            num_non_tsn_devices=args.num_non_tsn_devices,
             gamma=args.gamma,
             include_env_random=args.include_env_random,
             env_episodes=args.env_episodes,
             validate_replay=not args.no_validate_replay,
+            drl_model=args.drl_model,
+            include_drl_failures=args.include_drl_failures,
+            drl_max_steps=args.drl_max_steps,
         )
     else:
         dataset = build_multi_topo_dataset(
@@ -571,8 +759,12 @@ def main():
             output_base=output_base,
             timeout_s=args.timeout,
             link_rate=args.link_rate,
+            num_non_tsn_devices=args.num_non_tsn_devices,
             gamma=args.gamma,
             validate_replay=not args.no_validate_replay,
+            drl_model=args.drl_model,
+            include_drl_failures=args.include_drl_failures,
+            drl_max_steps=args.drl_max_steps,
         )
 
     logger.info(f"\n{'='*60}")
